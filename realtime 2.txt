@@ -1,0 +1,443 @@
+import os
+import torch
+import numpy as np
+import sounddevice as sd
+import queue
+import threading
+import time
+import signal
+import wave
+import pyaudio
+import tkinter as tk
+from tkinter import ttk, scrolledtext
+from faster_whisper import WhisperModel
+import soundfile as sf
+from transformers import M2M100ForConditionalGeneration, M2M100Tokenizer, SpeechT5Processor, SpeechT5ForTextToSpeech
+from threading import Event
+
+# Global settings
+SAMPLE_RATE = 16000
+CHUNK_DURATION = 0.2  # Process in very small chunks (200ms) for near real-time results
+CHUNK_SIZE = int(SAMPLE_RATE * CHUNK_DURATION)
+CHANNELS = 1
+FORMAT = pyaudio.paFloat32
+DTYPE = np.float32
+
+# Translation settings
+SRC_LANG = "en"
+TGT_LANG = "fr"  # Change to desired target language
+
+# Model settings
+WHISPER_MODEL = "small"  # Using smaller model for faster processing
+M2M_MODEL = "facebook/m2m100_418M"
+
+# Queue for audio chunks
+audio_queue = queue.Queue()
+# Queue for translated text
+translated_words_queue = queue.Queue()
+# Queue for translated speech
+tts_queue = queue.Queue()
+
+# Control flags
+is_running = False
+models_loaded = Event()
+
+# For continuous word streaming
+ongoing_translation = ""
+last_processed_text = ""
+concurrent_audio = None
+
+# For handling audio
+input_audio_buffer = np.array([], dtype=DTYPE)
+input_audio_start_time = 0
+translation_delay = 0  # To track system latency
+
+# GUI elements
+root = None
+translation_display = None
+stats_label = None
+
+# Models
+whisper_model = None
+m2m_tokenizer = None
+m2m_model = None
+processor = None
+tts_model = None
+speaker_embeddings = None
+
+def load_models():
+    """Load all required models with optimizations for speed."""
+    global whisper_model, m2m_tokenizer, m2m_model, processor, tts_model, speaker_embeddings
+    
+    try:
+        print("Loading Whisper ASR model (small version for speed)...")
+        whisper_model = WhisperModel(WHISPER_MODEL, device="cuda" if torch.cuda.is_available() else "cpu", compute_type="float16")
+        
+        print("Loading M2M-100 translation model...")
+        m2m_tokenizer = M2M100Tokenizer.from_pretrained(M2M_MODEL)
+        m2m_model = M2M100ForConditionalGeneration.from_pretrained(M2M_MODEL).to("cuda" if torch.cuda.is_available() else "cpu")
+        m2m_tokenizer.src_lang = SRC_LANG
+        
+        print("Loading SpeechT5 TTS model...")
+        processor = SpeechT5Processor.from_pretrained("microsoft/speecht5_tts")
+        tts_model = SpeechT5ForTextToSpeech.from_pretrained("microsoft/speecht5_tts").to("cuda" if torch.cuda.is_available() else "cpu")
+        speaker_embeddings = torch.randn(1, 512).to("cuda" if torch.cuda.is_available() else "cpu")
+        
+        models_loaded.set()
+        print("All models loaded successfully.")
+    except Exception as e:
+        print(f"Error loading models: {e}")
+        raise
+
+def capture_audio_stream():
+    """Capture audio in small chunks for real-time processing."""
+    global input_audio_buffer, input_audio_start_time
+    
+    p = pyaudio.PyAudio()
+    
+    def callback(in_data, frame_count, time_info, status):
+        if is_running:
+            audio_data = np.frombuffer(in_data, dtype=DTYPE)
+            audio_queue.put(audio_data)
+            
+            # Also store for potential playback synchronization
+            if input_audio_buffer.size == 0:
+                input_audio_start_time = time.time()
+            input_audio_buffer = np.append(input_audio_buffer, audio_data)
+            
+            # Limit buffer to 5 seconds to prevent memory issues
+            max_buffer = SAMPLE_RATE * 5
+            if input_audio_buffer.size > max_buffer:
+                input_audio_buffer = input_audio_buffer[-max_buffer:]
+                
+        return (in_data, pyaudio.paContinue)
+    
+    try:
+        stream = p.open(
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=SAMPLE_RATE,
+            input=True,
+            output=False,
+            frames_per_buffer=CHUNK_SIZE,
+            stream_callback=callback
+        )
+        
+        print("Audio capture started")
+        stream.start_stream()
+        
+        # Keep thread alive
+        while is_running:
+            time.sleep(0.1)
+            
+        # Clean up
+        stream.stop_stream()
+        stream.close()
+        p.terminate()
+    except Exception as e:
+        print(f"Error in audio capture: {e}")
+
+def process_audio_realtime():
+    """Process audio chunks continuously without waiting for silence."""
+    # Wait for models to be loaded
+    models_loaded.wait()
+    
+    global last_processed_text, ongoing_translation, translation_delay
+    
+    # Buffer to accumulate audio for processing
+    processing_buffer = np.array([], dtype=DTYPE)
+    accumulated_duration = 0
+    min_process_duration = 0.5  # Process at least 0.5 seconds of audio at a time
+    max_process_duration = 2.0  # Don't accumulate more than 2 seconds to keep latency low
+    
+    # For continuous processing
+    previous_text = ""
+    continuous_segment = None
+    segment_callback = None
+    
+    while is_running or not audio_queue.empty():
+        try:
+            # Get audio chunk
+            try:
+                chunk = audio_queue.get(timeout=0.1)
+                audio_queue.task_done()
+            except queue.Empty:
+                continue
+            
+            # Add chunk to processing buffer
+            processing_buffer = np.append(processing_buffer, chunk)
+            chunk_duration = len(chunk) / SAMPLE_RATE
+            accumulated_duration += chunk_duration
+            
+            # Process if we have enough audio
+            if accumulated_duration >= min_process_duration:
+                # Save buffer to temporary file
+                temp_file = "temp_audio_processing.wav"
+                sf.write(temp_file, processing_buffer, SAMPLE_RATE)
+                
+                processing_start = time.time()
+                
+                # If we were processing a continuous segment, stop it
+                if continuous_segment is not None:
+                    continuous_segment.terminate()
+                    continuous_segment = None
+                
+                # Start a new continuous transcription
+                try:
+                    continuous_segment, segment_callback = whisper_model.transcribe(temp_file, beam_size=3, word_timestamps=True)
+                    
+                    # Process word by word as they become available
+                    for segment in continuous_segment:
+                        for word in segment.words:
+                            word_text = word.word
+                            
+                            # Skip if this is the exact same text (avoid duplicates)
+                            if word_text.strip() and not previous_text.endswith(word_text):
+                                previous_text += " " + word_text
+                                
+                                # Process each word independently to improve speed
+                                new_text = previous_text.strip()
+                                
+                                if new_text and new_text != last_processed_text:
+                                    # Translate the new text
+                                    m2m_tokenizer.src_lang = SRC_LANG
+                                    inputs = m2m_tokenizer(new_text, return_tensors="pt").to("cuda" if torch.cuda.is_available() else "cpu")
+                                    m2m_tokenizer.tgt_lang = TGT_LANG
+                                    
+                                    with torch.no_grad():
+                                        translated_tokens = m2m_model.generate(
+                                            **inputs, 
+                                            forced_bos_token_id=m2m_tokenizer.get_lang_id(TGT_LANG),
+                                            max_length=100
+                                        )
+                                    
+                                    translated_text = m2m_tokenizer.decode(translated_tokens[0], skip_special_tokens=True)
+                                    
+                                    # Record translation delay
+                                    translation_delay = time.time() - processing_start
+                                    
+                                    # Update last processed text
+                                    last_processed_text = new_text
+                                    ongoing_translation = translated_text
+                                    
+                                    # Queue for display and TTS
+                                    translated_words_queue.put(translated_text)
+                                    
+                                    # FIX: Queue each word independently for TTS instead of batching
+                                    # Extract just the newest word(s) by comparing with previous translation
+                                    words = translated_text.split()
+                                    if len(words) > 0:
+                                        # Send the last word to TTS
+                                        tts_queue.put(words[-1])
+                
+                except Exception as e:
+                    print(f"Error in transcription/translation: {e}")
+                
+                # Reset buffer if we've accumulated too much audio
+                if accumulated_duration >= max_process_duration:
+                    processing_buffer = np.array([], dtype=DTYPE)
+                    accumulated_duration = 0
+                else:
+                    # Keep the last portion for context
+                    keep_duration = min(accumulated_duration, max_process_duration - min_process_duration)
+                    keep_samples = int(keep_duration * SAMPLE_RATE)
+                    processing_buffer = processing_buffer[-keep_samples:]
+                    accumulated_duration = keep_duration
+                
+                # Clean up
+                try:
+                    os.remove(temp_file)
+                except:
+                    pass
+                
+        except Exception as e:
+            print(f"Error in audio processing: {e}")
+    
+    print("Audio processing thread completed")
+
+def text_to_speech_realtime():
+    """Generate and play speech in smaller chunks to reduce latency."""
+    # Wait for models to be loaded
+    models_loaded.wait()
+    
+    global concurrent_audio
+    
+    p = pyaudio.PyAudio()
+    stream = None
+    
+    try:
+        # Setup audio output stream
+        stream = p.open(
+            format=pyaudio.paFloat32,
+            channels=1,
+            rate=24000,  # SpeechT5 output rate
+            output=True,
+            frames_per_buffer=1024
+        )
+        
+        while is_running or not tts_queue.empty():
+            try:
+                # Get translation with timeout
+                translated_text = tts_queue.get(timeout=0.1)
+                tts_queue.task_done()
+            except queue.Empty:
+                continue
+            
+            if not translated_text.strip():
+                continue
+            
+            # Generate speech
+            try:
+                with torch.no_grad():
+                    inputs = processor(text=translated_text, return_tensors="pt").to("cuda" if torch.cuda.is_available() else "cpu")
+                    speech = tts_model.generate_speech(inputs["input_ids"], speaker_embeddings).cpu().numpy()
+                
+                # Play directly without saving to file
+                concurrent_audio = speech
+                stream.write(speech.astype(np.float32).tobytes())
+                
+            except Exception as e:
+                print(f"Error in TTS: {e}")
+                
+    except Exception as e:
+        print(f"Error in TTS thread: {e}")
+    finally:
+        if stream:
+            stream.stop_stream()
+            stream.close()
+        p.terminate()
+    
+    print("TTS thread completed")
+
+def update_gui():
+    """Update the GUI with translations."""
+    global translation_display, stats_label, ongoing_translation, translation_delay
+    
+    if not is_running:
+        return
+    
+    try:
+        # Check for new translations
+        while not translated_words_queue.empty():
+            translation = translated_words_queue.get_nowait()
+            translated_words_queue.task_done()
+            
+            # Update the display
+            translation_display.config(state=tk.NORMAL)
+            translation_display.delete(1.0, tk.END)
+            translation_display.insert(tk.END, translation)
+            translation_display.see(tk.END)
+            translation_display.config(state=tk.DISABLED)
+        
+        # Update statistics
+        if stats_label:
+            stats_label.config(text=f"Translation delay: {translation_delay:.2f}s")
+        
+        # FIX: Reduce GUI update interval from 50ms to 25ms for better sync
+        if root:
+            root.after(25, update_gui)  # Updated from 50ms to 25ms
+            
+    except Exception as e:
+        print(f"Error updating GUI: {e}")
+
+def create_gui():
+    """Create a simple GUI for displaying translations."""
+    global root, translation_display, stats_label
+    
+    root = tk.Tk()
+    root.title("Realtime Speech Translation")
+    root.geometry("800x300")
+    
+    frame = ttk.Frame(root, padding="10")
+    frame.pack(fill=tk.BOTH, expand=True)
+    
+    # Source language label
+    ttk.Label(frame, text=f"Translating from {SRC_LANG} to {TGT_LANG}", font=("Arial", 12)).pack(pady=5)
+    
+    # Translation display
+    translation_display = scrolledtext.ScrolledText(frame, wrap=tk.WORD, height=10, font=("Arial", 14))
+    translation_display.pack(fill=tk.BOTH, expand=True, pady=5)
+    translation_display.config(state=tk.DISABLED)
+    
+    # Statistics display
+    stats_label = ttk.Label(frame, text="System initializing...", font=("Arial", 10))
+    stats_label.pack(pady=5)
+    
+    # Controls
+    control_frame = ttk.Frame(frame)
+    control_frame.pack(fill=tk.X, pady=10)
+    
+    def stop_application():
+        global is_running
+        is_running = False
+        root.destroy()
+    
+    ttk.Button(control_frame, text="Stop", command=stop_application).pack(side=tk.RIGHT)
+    
+    # Start GUI update loop with improved refresh rate
+    root.after(25, update_gui)  # Updated initial interval from 100ms to 25ms
+    
+    return root
+
+def signal_handler(sig, frame):
+    """Handle interruption signals."""
+    global is_running
+    print("\nShutting down, please wait...")
+    is_running = False
+    
+    if root:
+        root.destroy()
+
+def main():
+    """Main function for realtime translation system."""
+    global is_running
+    
+    # Register signal handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    try:
+        is_running = True
+        
+        # Create and start the model loading thread
+        model_thread = threading.Thread(target=load_models)
+        model_thread.daemon = True
+        model_thread.start()
+        
+        print("Loading models, please wait...")
+        
+        # Start worker threads
+        audio_thread = threading.Thread(target=capture_audio_stream)
+        processing_thread = threading.Thread(target=process_audio_realtime)
+        tts_thread = threading.Thread(target=text_to_speech_realtime)
+        
+        audio_thread.daemon = True
+        processing_thread.daemon = True
+        tts_thread.daemon = True
+        
+        audio_thread.start()
+        processing_thread.start()
+        tts_thread.start()
+        
+        # Wait for models to load before showing GUI
+        models_loaded.wait()
+        
+        print("\n" + "="*50)
+        print("TRUE Realtime Speech Translation System Ready")
+        print(f"Source language: {SRC_LANG}, Target language: {TGT_LANG}")
+        print("="*50 + "\n")
+        
+        # Create and run GUI (this blocks until GUI is closed)
+        gui_root = create_gui()
+        gui_root.mainloop()
+        
+    except Exception as e:
+        print(f"Error in main thread: {e}")
+    finally:
+        # Signal threads to stop
+        is_running = False
+        
+        print("System shutdown complete.")
+
+if __name__ == "__main__":
+    main()
